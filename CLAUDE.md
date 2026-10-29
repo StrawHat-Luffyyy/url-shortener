@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-Phases 0 (Foundations) and 1 (Core shortener) are built. The spec is `PRD AI-Protected URL Shortening Service.docx` (Draft v1). Add commands below only once they actually work (k6/autocannon load tests and Kafka are still to come).
+Phases 0 (Foundations), 1 (Core shortener) and 2 (Performance) are built; benchmark results and findings are in `docs/benchmarks.md`. The spec is `PRD AI-Protected URL Shortening Service.docx` (Draft v1). Add commands below only once they actually work (Kafka is still to come).
 
 Deferred from Phase 1 on purpose. Each needs a piece from a later phase:
 - `max_clicks` is stored but not enforced, because that needs click counting (Phase 3).
@@ -22,6 +22,8 @@ npx vitest run -t "revoked key"      # tests whose name matches
 npm run typecheck                    # tsc --noEmit (no lint configured yet)
 npm run migrate                      # apply src/db/migrations/*.sql to $DATABASE_URL
 npm run dev                          # tsx watch src/server.ts; needs DATABASE_URL, REDIS_URL, OPERATOR_TOKEN, BASE_URL (see .env.example)
+npm run bench:redirect               # redirect load test against the dev DB (seeds, runs, cleans up); BENCH_* env vars in bench/redirect.ts
+                                     # two machines: BENCH_MODE=serve here, BENCH_MODE=load BENCH_TARGET=http://<ip>:3990 there
 ```
 
 There is no build step: tsx runs the TypeScript directly. Vitest is pinned to 4.x because vitest 5.0.5 pulls a `rolldown` tarball that 404s on npm.
@@ -42,6 +44,15 @@ There is no build step: tsx runs the TypeScript directly. Vitest is pinned to 4.
   - The Redis counter (`links:id_counter`) counts **ids, not blocks**, so instances with different block sizes can share it. Counting blocks once let the counter run 100× ahead.
   - It is reseeded from `max(links.id)` at startup and whenever a lease goes backwards.
   - **Never call `ids.next()` inside a transaction**: a lease may need a pooled connection, and 10k parallel creates deadlocked the pool that way. Take the id first, then open the transaction (`withNewId`), which retries the whole transaction on a code/pk clash.
+- Redirect path: `src/links/resolver.ts` (cache-aside in Redis, `link:c:<code>`).
+  - Unknown codes are cached for 30 s, links for 60 s.
+  - Concurrent misses on one instance share one load.
+  - **Every write to a link must call `links.invalidate(code)`, creation included**, because the code may be cached as a miss.
+  - Invalidation bumps a per-code generation (`link:gen:<code>`), and a fill only writes if the generation hasn't changed since its load started. That stops a load that read the old row from caching it after the change. Don't replace this with a time-window tombstone: that disabled caching for 5 s after every create and hid missing invalidations from the tests.
+  - Redis errors on this path fall back to Postgres and never fail a redirect.
+- Rate limits (`src/rate-limit.ts`): a per-tenant token bucket in Redis (Lua, Redis server clock). `create` covers `POST /v1/links`, `api` covers every other tenant call; redirects aren't limited. If Redis is down, each instance limits locally. Tests get unlimited buckets from `newInstance()` unless they pass `rateLimits`.
+- Production Redis client (`src/server.ts`): `enableOfflineQueue: false` and a 100 ms command timeout, so an outage falls back instead of hanging requests. Keep `keepAliveTimeout` at 65 s (see docs/benchmarks.md finding 3).
+- Benchmarks: use `bench/redirect.ts` (open-loop, paced, multi-threaded, flags a generator that falls behind). Don't go back to autocannon's `overallRate`: it sends in bursts and inflated p99 about 17×.
 - Aliases share the code namespace with generated codes and are global across tenants (409 `ALIAS_TAKEN`).
 - Idempotency is a per-(tenant, key) advisory lock plus the `idempotency_keys` row. Reusing a key for a different body is a 422.
 - Migrations: plain SQL files `src/db/migrations/NNN_name.sql`, applied in filename order and tracked in `schema_migrations`. Never edit an applied migration; add a new one.

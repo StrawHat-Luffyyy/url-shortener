@@ -9,7 +9,8 @@
     "migrate": "tsx src/db/migrate.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench:redirect": "tsx bench/redirect.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.5",

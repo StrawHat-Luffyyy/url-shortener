@@ -6,7 +6,9 @@ import { z } from "zod";
 import { authenticateApiKey, issueApiKey } from "./auth/api-keys";
 import { ApiError, errorResponse, parseBody } from "./errors";
 import { createIdAllocator } from "./links/id-allocator";
-import { linkRoutes, redirectRoute } from "./links/routes";
+import { createLinkResolver } from "./links/resolver";
+import { linkRoutes, loadLinkForRedirect, redirectRoute } from "./links/routes";
+import { createRateLimiter, type Bucket } from "./rate-limit";
 
 export type AppDeps = {
   sql: Sql;
@@ -15,6 +17,14 @@ export type AppDeps = {
   baseUrl: string;
   // Link ids leased from Redis per round trip (default 1000).
   idBlockSize?: number;
+  // Per-tenant token buckets: `create` for POST /v1/links, `api` for every
+  // other tenant call. Redirects are not limited per tenant.
+  rateLimits?: { create: Bucket; api: Bucket };
+};
+
+const DEFAULT_RATE_LIMITS = {
+  create: { capacity: 100, refillPerSecond: 20 },
+  api: { capacity: 600, refillPerSecond: 100 },
 };
 type Env = { Variables: { tenantId: string } };
 
@@ -29,7 +39,14 @@ function sameSecret(a: string, b: string): boolean {
   return timingSafeEqual(h(a), h(b));
 }
 
-export function createApp({ sql, redis, operatorToken, baseUrl, idBlockSize }: AppDeps) {
+export function createApp({
+  sql,
+  redis,
+  operatorToken,
+  baseUrl,
+  idBlockSize,
+  rateLimits = DEFAULT_RATE_LIMITS,
+}: AppDeps) {
   const app = new Hono<Env>();
 
   app.onError((err, c) => {
@@ -71,6 +88,18 @@ export function createApp({ sql, redis, operatorToken, baseUrl, idBlockSize }: A
     await next();
   });
 
+  const limiter = createRateLimiter(redis);
+  tenantApi.use(async (c, next) => {
+    const isCreate = c.req.method === "POST" && c.req.path === "/v1/links";
+    const name = isCreate ? "create" : "api";
+    const result = await limiter.take(`${name}:${c.get("tenantId")}`, rateLimits[name]);
+    if (!result.allowed) {
+      c.header("retry-after", String(Math.ceil(result.retryAfterMs / 1000)));
+      throw new ApiError(429, "RATE_LIMITED", "Rate limit exceeded");
+    }
+    await next();
+  });
+
   tenantApi.get("/tenant", async (c) => {
     const [tenant] = await sql`SELECT id, name, plan, created_at FROM tenants WHERE id = ${c.get("tenantId")}`;
     return c.json({ tenant });
@@ -101,10 +130,11 @@ export function createApp({ sql, redis, operatorToken, baseUrl, idBlockSize }: A
     return c.body(null, 204);
   });
 
-  tenantApi.route("/", linkRoutes({ sql, ids: createIdAllocator(redis, sql, idBlockSize), baseUrl }));
+  const links = createLinkResolver({ redis, load: loadLinkForRedirect(sql) });
+  tenantApi.route("/", linkRoutes({ sql, ids: createIdAllocator(redis, sql, idBlockSize), links, baseUrl }));
 
   app.route("/v1/operator", operator);
   app.route("/v1", tenantApi);
-  app.route("/", redirectRoute(sql));
+  app.route("/", redirectRoute(links));
   return app;
 }

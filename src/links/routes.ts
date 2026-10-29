@@ -6,6 +6,7 @@ import { ApiError, parseBody } from "../errors";
 import { codeForId } from "./codes";
 import { parseDestination } from "./destination";
 import type { IdAllocator } from "./id-allocator";
+import type { CachedLink, LinkResolver } from "./resolver";
 
 type LinkRow = {
   id: string;
@@ -20,7 +21,7 @@ type LinkRow = {
   updated_at: Date;
 };
 
-type Deps = { sql: Sql; ids: IdAllocator; baseUrl: string };
+type Deps = { sql: Sql; ids: IdAllocator; links: LinkResolver; baseUrl: string };
 type Env = { Variables: { tenantId: string } };
 
 const futureDate = z.iso
@@ -79,7 +80,7 @@ export function toLinkJson(row: LinkRow, baseUrl: string) {
 }
 
 // Tenant-scoped link management, mounted under /v1 behind API-key auth.
-export function linkRoutes({ sql, ids, baseUrl }: Deps) {
+export function linkRoutes({ sql, ids, links, baseUrl }: Deps) {
   const routes = new Hono<Env>();
 
   async function insertLink(tx: TransactionSql, id: number, tenantId: string, input: CreateInput) {
@@ -145,6 +146,8 @@ export function linkRoutes({ sql, ids, baseUrl }: Deps) {
         VALUES (${tenantId}, ${idempotencyKey}, ${requestHash}, ${created.id})`;
       return created;
     });
+    // The code may be cached as a miss (someone looked up the alias earlier).
+    await links.invalidate(row.code);
     return c.json({ link: toLinkJson(row, baseUrl) }, 201);
   });
 
@@ -176,6 +179,7 @@ export function linkRoutes({ sql, ids, baseUrl }: Deps) {
       WHERE code = ${c.req.param("code")} AND tenant_id = ${c.get("tenantId")} AND status <> 'deleted'
       RETURNING *`;
     if (!row) throw notFound();
+    await links.invalidate(row.code);
     return c.json({ link: toLinkJson(row, baseUrl) });
   });
 
@@ -185,33 +189,54 @@ export function linkRoutes({ sql, ids, baseUrl }: Deps) {
       WHERE code = ${c.req.param("code")} AND tenant_id = ${c.get("tenantId")} AND status <> 'deleted'
       RETURNING id`;
     if (deleted.length === 0) throw notFound();
+    await links.invalidate(c.req.param("code"));
     return c.body(null, 204);
   });
 
   return routes;
 }
 
+// The redirect handler's view of a link, read from Postgres on a cache miss.
+export function loadLinkForRedirect(sql: Sql) {
+  return async (code: string): Promise<CachedLink | null> => {
+    const [row] = await sql<Pick<LinkRow, "long_url" | "status" | "redirect_type" | "active" | "expires_at">[]>`
+      SELECT long_url, status, redirect_type, active, expires_at FROM links WHERE code = ${code}`;
+    if (!row) return null;
+    return {
+      url: row.long_url,
+      status: row.status,
+      redirectType: row.redirect_type === 301 ? 301 : 302,
+      active: row.active,
+      expiresAt: row.expires_at?.getTime() ?? null,
+    };
+  };
+}
+
+// Anything else can't be a code (generated or alias), so it is rejected
+// without touching the cache or the database.
+const CODE_SHAPE = /^[A-Za-z0-9_-]{3,32}$/;
+
 // Public redirect (FR-8, FR-9). Mounted last so it never shadows /v1 routes.
-export function redirectRoute(sql: Sql) {
+export function redirectRoute(links: LinkResolver) {
   const routes = new Hono();
 
   routes.get("/:code", async (c) => {
-    const [link] = await sql<Pick<LinkRow, "long_url" | "status" | "redirect_type" | "active" | "expires_at">[]>`
-      SELECT long_url, status, redirect_type, active, expires_at FROM links WHERE code = ${c.req.param("code")}`;
+    const code = c.req.param("code");
+    const link = CODE_SHAPE.test(code) ? await links.resolve(code) : null;
     if (!link) throw new ApiError(404, "NOT_FOUND", "Short link not found");
 
-    const expired = link.expires_at !== null && link.expires_at.getTime() <= Date.now();
+    const expired = link.expiresAt !== null && link.expiresAt <= Date.now();
     // Only active links redirect. Phase 4 adds the interstitial for quarantined links.
     if (link.status !== "active" || !link.active || expired) {
       throw new ApiError(410, "LINK_GONE", "This short link is no longer available");
     }
 
-    if (link.redirect_type === 302) {
+    if (link.redirectType === 302) {
       // Keep every click observable: browsers must not cache a 302 (FR-8).
       c.header("cache-control", "private, no-store");
-      return c.redirect(link.long_url, 302);
+      return c.redirect(link.url, 302);
     }
-    return c.redirect(link.long_url, 301);
+    return c.redirect(link.url, 301);
   });
 
   return routes;

@@ -13,7 +13,8 @@ export type ErrorCode =
   | "LINK_GONE"
   | "ALIAS_TAKEN"
   | "ALIAS_RESERVED"
-  | "IDEMPOTENCY_KEY_REUSED";
+  | "IDEMPOTENCY_KEY_REUSED"
+  | "RATE_LIMITED";
 
 export class ApiError extends Error {
   constructor(
