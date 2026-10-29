@@ -1,11 +1,21 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
+import type { Redis } from "ioredis";
 import type { Sql } from "postgres";
 import { z } from "zod";
 import { authenticateApiKey, issueApiKey } from "./auth/api-keys";
-import { ApiError, errorResponse } from "./errors";
+import { ApiError, errorResponse, parseBody } from "./errors";
+import { createIdAllocator } from "./links/id-allocator";
+import { linkRoutes, redirectRoute } from "./links/routes";
 
-export type AppDeps = { sql: Sql; operatorToken: string };
+export type AppDeps = {
+  sql: Sql;
+  redis: Redis;
+  operatorToken: string;
+  baseUrl: string;
+  // Link ids leased from Redis per round trip (default 1000).
+  idBlockSize?: number;
+};
 type Env = { Variables: { tenantId: string } };
 
 function bearer(header: string | undefined): string | null {
@@ -19,13 +29,7 @@ function sameSecret(a: string, b: string): boolean {
   return timingSafeEqual(h(a), h(b));
 }
 
-async function parseBody<T extends z.ZodType>(req: Request, schema: T): Promise<z.infer<T>> {
-  const parsed = schema.safeParse(await req.json().catch(() => undefined));
-  if (!parsed.success) throw new ApiError(400, "VALIDATION_FAILED", z.prettifyError(parsed.error));
-  return parsed.data;
-}
-
-export function createApp({ sql, operatorToken }: AppDeps) {
+export function createApp({ sql, redis, operatorToken, baseUrl, idBlockSize }: AppDeps) {
   const app = new Hono<Env>();
 
   app.onError((err, c) => {
@@ -97,7 +101,10 @@ export function createApp({ sql, operatorToken }: AppDeps) {
     return c.body(null, 204);
   });
 
+  tenantApi.route("/", linkRoutes({ sql, ids: createIdAllocator(redis, sql, idBlockSize), baseUrl }));
+
   app.route("/v1/operator", operator);
   app.route("/v1", tenantApi);
+  app.route("/", redirectRoute(sql));
   return app;
 }

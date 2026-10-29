@@ -7,6 +7,7 @@ export default defineConfig({
       TEST_DATABASE_URL:
         process.env.TEST_DATABASE_URL ??
         "postgres://shortener:shortener@localhost:5432/shortener_test",
+      TEST_REDIS_URL: process.env.TEST_REDIS_URL ?? "redis://localhost:6379/1",
     },
   },
 });

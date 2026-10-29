@@ -4,25 +4,46 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-Phase 0 (Foundations) is built: schema, migrations, tenant + API-key auth, isolation tests and CI. The spec is `PRD AI-Protected URL Shortening Service.docx` (Draft v1). Add commands below only once they actually work (k6/autocannon load tests and Kafka are still to come).
+Phases 0 (Foundations) and 1 (Core shortener) are built. The spec is `PRD AI-Protected URL Shortening Service.docx` (Draft v1). Add commands below only once they actually work (k6/autocannon load tests and Kafka are still to come).
+
+Deferred from Phase 1 on purpose. Each needs a piece from a later phase:
+- `max_clicks` is stored but not enforced, because that needs click counting (Phase 3).
+- Quarantined links don't get the interstitial page yet (Phase 4).
+- Status transitions aren't audited yet.
+- There's no DB-sequence fallback when Redis is down (`link_id_fallback_seq` exists but is unused; that's failure-mode work). Its range must not overlap the Redis counter's.
 
 ## Commands
 
 ```bash
 docker compose up -d --wait          # Postgres 17 (5432; creates shortener + shortener_test) and Redis 7 (6379)
-npm test                             # Vitest; global setup migrates shortener_test first. Needs Postgres running
+npm test                             # Vitest; global setup migrates shortener_test first. Needs Postgres + Redis (db 1)
 npx vitest run test/keys.test.ts     # one file
 npx vitest run -t "revoked key"      # tests whose name matches
 npm run typecheck                    # tsc --noEmit (no lint configured yet)
 npm run migrate                      # apply src/db/migrations/*.sql to $DATABASE_URL
-npm run dev                          # tsx watch src/server.ts; needs DATABASE_URL and OPERATOR_TOKEN (see .env.example)
+npm run dev                          # tsx watch src/server.ts; needs DATABASE_URL, REDIS_URL, OPERATOR_TOKEN, BASE_URL (see .env.example)
 ```
 
 There is no build step: tsx runs the TypeScript directly. Vitest is pinned to 4.x because vitest 5.0.5 pulls a `rolldown` tarball that 404s on npm.
 
 ## Code layout and conventions so far
 
-- `src/app.ts`: `createApp({ sql, operatorToken })` builds the Hono app with its dependencies passed in. Tests call `app.request()` against a real Postgres (`test/helpers.ts`). This HTTP + real-DB seam is the agreed test seam: don't mock the DB, and don't assert by querying tables directly. Each test creates its own tenants, so there's no truncation between tests.
+- `src/app.ts`: `createApp({ sql, redis, operatorToken, baseUrl, idBlockSize? })` builds the Hono app with its dependencies passed in. Each call is a separate "instance" with its own ID allocator. Tests call `app.request()` against real Postgres and Redis (`test/helpers.ts`; `newInstance()` simulates extra API processes). The agreed test seams:
+  - HTTP + real Postgres/Redis for behavior. Don't mock either, and don't assert by querying tables.
+  - Pure table tests for `parseDestination` (`src/links/destination.ts`).
+
+  Each test creates its own tenants and fresh aliases, so nothing is truncated between tests. Test files run in parallel against the same DB and Redis.
+- Links live in `src/links/`:
+  - `destination.ts`: validation + FR-7 normalization. Redirects go to `url` (the WHATWG serialization). `normalized` is for matching only.
+  - `codes.ts`: id → 7-char code via multiply-mod-62⁷ + Base62.
+  - `id-allocator.ts`: block leasing.
+  - `routes.ts`: the CRUD endpoints plus the public `GET /:code`, mounted last.
+- ID allocator invariants:
+  - The Redis counter (`links:id_counter`) counts **ids, not blocks**, so instances with different block sizes can share it. Counting blocks once let the counter run 100× ahead.
+  - It is reseeded from `max(links.id)` at startup and whenever a lease goes backwards.
+  - **Never call `ids.next()` inside a transaction**: a lease may need a pooled connection, and 10k parallel creates deadlocked the pool that way. Take the id first, then open the transaction (`withNewId`), which retries the whole transaction on a code/pk clash.
+- Aliases share the code namespace with generated codes and are global across tenants (409 `ALIAS_TAKEN`).
+- Idempotency is a per-(tenant, key) advisory lock plus the `idempotency_keys` row. Reusing a key for a different body is a 422.
 - Migrations: plain SQL files `src/db/migrations/NNN_name.sql`, applied in filename order and tracked in `schema_migrations`. Never edit an applied migration; add a new one.
 - Auth: `/v1/operator/*` uses `Authorization: Bearer $OPERATOR_TOKEN` (the platform operator; creates tenants and their first key). Every other `/v1/*` route authenticates an API key and sets `c.get("tenantId")`. **Every tenant query must filter on that tenant id.** Return 404, not 403, for other tenants' resources.
 - API keys look like `sk_<12 hex>_<43 base64url>`. The prefix is public and used for lookup; only the SHA-256 of the whole key is stored, compared with `timingSafeEqual`. The full key is returned once, at creation.
