@@ -17,9 +17,8 @@ export type ClickEvent = {
   response_code: number;
 };
 
-export type ClickMessage = { key: string; value: string };
 // Delivers a batch, or rejects so the batch can be retried.
-export type ClickSink = (messages: ClickMessage[]) => Promise<void>;
+export type ClickSink = (events: ClickEvent[]) => Promise<void>;
 
 export type ClickEmitter = {
   // Queues the event and returns at once. Never throws, never waits.
@@ -49,7 +48,7 @@ export function createClickEmitter({
   flushIntervalMs = 20,
   retryDelayMs = 1000,
 }: Options): ClickEmitter {
-  let buffer: ClickMessage[] = [];
+  let buffer: ClickEvent[] = [];
   let inFlight = 0;
   let sent = 0;
   let dropped = 0;
@@ -100,7 +99,7 @@ export function createClickEmitter({
         dropped++;
         return;
       }
-      buffer.push({ key: event.link_id, value: JSON.stringify(event) });
+      buffer.push(event);
       schedule(buffer.length >= maxBatch ? 0 : flushIntervalMs);
     },
 
@@ -121,6 +120,37 @@ export function createClickEmitter({
   };
 }
 
+// FNV-1a: a cheap, stable string hash for picking a partition.
+function hash(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
+  return h >>> 0;
+}
+
+// Most events per Kafka message, keeping messages well under Kafka's 1 MB default.
+const MAX_EVENTS_PER_MESSAGE = 1000;
+
+// Packs events into one Kafka message per partition: a JSON array of events.
+// One message per click cost the producer and broker 2–5× more CPU per click
+// (docs/benchmarks.md). A link always hashes to the same partition, so its
+// clicks stay in order. Changing the partition count remaps links; avoid it.
+export function packByPartition(events: ClickEvent[], partitions: number) {
+  const groups = new Map<number, ClickEvent[]>();
+  for (const event of events) {
+    const p = hash(event.link_id) % partitions;
+    const group = groups.get(p);
+    if (group) group.push(event);
+    else groups.set(p, [event]);
+  }
+  const messages: { partition: number; value: string }[] = [];
+  for (const [partition, group] of groups) {
+    for (let i = 0; i < group.length; i += MAX_EVENTS_PER_MESSAGE) {
+      messages.push({ partition, value: JSON.stringify(group.slice(i, i + MAX_EVENTS_PER_MESSAGE)) });
+    }
+  }
+  return messages;
+}
+
 // Sends batches to a Kafka topic. librdkafka can take over a minute to give up
 // on an unreachable broker, so each attempt (connect + send) is capped at
 // `timeoutMs`; after a failure the next attempt starts with a fresh producer.
@@ -130,7 +160,7 @@ export function createKafkaSink(
   { timeoutMs = 10_000 } = {},
 ): ClickSink & { disconnect(): Promise<void> } {
   let producer: ReturnType<Kafka["producer"]> | null = null;
-  let connected: Promise<void> | null = null;
+  let connected: Promise<number> | null = null; // resolves to the topic's partition count
 
   function reset() {
     const old = producer;
@@ -139,16 +169,32 @@ export function createKafkaSink(
     old?.disconnect().catch(() => {});
   }
 
-  const sink = async (messages: ClickMessage[]) => {
+  async function connect(p: NonNullable<typeof producer>) {
+    await p.connect();
+    const admin = kafka.admin();
+    await admin.connect();
+    try {
+      const [meta] = await admin.fetchTopicMetadata({ topics: [topic] });
+      if (!meta?.partitions.length) throw new Error(`topic ${topic} not found`);
+      return meta.partitions.length;
+    } finally {
+      await admin.disconnect().catch(() => {});
+    }
+  }
+
+  const sink = async (events: ClickEvent[]) => {
     producer ??= kafka.producer({ kafkaJS: { acks: 1 }, "linger.ms": 5, "message.timeout.ms": timeoutMs });
     const current = producer;
-    connected ??= current.connect();
+    connected ??= connect(current);
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error(`Kafka send timed out after ${timeoutMs}ms`)), timeoutMs);
     });
     try {
-      await Promise.race([connected.then(() => current.send({ topic, messages })), timeout]);
+      await Promise.race([
+        connected.then((partitions) => current.send({ topic, messages: packByPartition(events, partitions) })),
+        timeout,
+      ]);
     } catch (err) {
       reset();
       throw err;

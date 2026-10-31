@@ -11,7 +11,7 @@ Deferred on purpose. Each needs a piece from a later phase:
 - Status transitions aren't audited yet.
 - Click events carry `asn`, `is_datacenter_asn` and (without a trusted proxy) `country` as null: there's no GeoIP/ASN lookup yet (Phase 5 needs it).
 - Labels come only from user-agent rules; everything not caught is `human` until the Phase 5 model.
-- The G1 redirect benchmark hasn't been rerun with click tracking on a quiet machine. Tracking adds about 20–130 µs of server CPU per redirect (docs/benchmarks.md).
+- G1 with click tracking on isn't shown yet. Tracking off meets G1 cleanly on the laptop. Tracking on still starves it at 4k req/s (generator flagged), even after packing clicks cut producer/broker CPU per click 2–5×. It needs an idle machine or Kafka/the generator off-box (docs/benchmarks.md).
 - There's no DB-sequence fallback when Redis is down (`link_id_fallback_seq` exists but is unused; that's failure-mode work). Its range must not overlap the Redis counter's.
 
 ## Commands
@@ -57,8 +57,9 @@ There is no build step: tsx runs the TypeScript directly. Vitest is pinned to 4.
 - Production Redis client (`src/server.ts`): `enableOfflineQueue: false` and a 100 ms command timeout, so an outage falls back instead of hanging requests. Keep `keepAliveTimeout` at 65 s (see docs/benchmarks.md finding 3).
 - Benchmarks: use `bench/redirect.ts` (open-loop, paced, multi-threaded, flags a generator that falls behind). Don't go back to autocannon's `overallRate`: it sends in bursts and inflated p99 about 17×.
 - Click pipeline (`src/analytics/`):
-  - `emitter.ts`: the redirect calls `emit()`, which never waits or throws. It uses a bounded buffer, one batch in flight, and a failed batch goes back in the buffer; overflow is dropped and counted. `createKafkaSink` caps each attempt at 10 s because librdkafka took 81 s to give up on a dead broker. Don't use the client's `connectionTimeout` for this: it made connects hang instead.
-  - `consumer.ts`: one SQL statement inserts into `click_events` with `ON CONFLICT DO NOTHING` and builds the rollups **from the rows actually inserted**. That's the whole dedup story (replay and redelivery count once). Offsets are committed after the DB write. Bad messages go to `<topic>.dlq`.
+  - `emitter.ts`: the redirect calls `emit()`, which never waits or throws. It uses a bounded buffer, one batch in flight, and a failed batch goes back in the buffer; overflow is dropped and counted.
+  - **Wire format on `clicks.raw`:** each message is a JSON array of events, packed per partition by `packByPartition` (FNV-1a of `link_id` mod partition count, so a link's clicks stay ordered in one partition). Readers must also accept a single event object (the earlier format). The Phase 5 Python service must read both. Changing the topic's partition count remaps links. `createKafkaSink` caps each attempt at 10 s because librdkafka took 81 s to give up on a dead broker. Don't use the client's `connectionTimeout` for this: it made connects hang instead.
+  - `consumer.ts`: one SQL statement inserts into `click_events` with `ON CONFLICT DO NOTHING` and builds the rollups **from the rows actually inserted**. That's the whole dedup story (replay and redelivery count once). Offsets are committed after the DB write. Bad messages, or bad events inside a packed message, go to `<topic>.dlq` one by one. `stats()` counts events, not messages.
   - `partitions.ts`: `click_events` has UTC-day partitions, created ahead of time, and dropped after 90 days. A day must be created before its rows arrive, or they land in the default partition for good.
   - Analytics API (`routes.ts`): clicks and series come from rollups (kept forever). Uniques and top-N come from raw events (90 days, reported as `rawFrom`). The `bot` view counts `suspected_bot` + `known_crawler`.
   - Kafka tests use a topic per test file (`test/kafka-helpers.ts`); `eventually()` waits for the consumer. To replay a group, delete it with the admin client (there's no offset-reset API in this client).

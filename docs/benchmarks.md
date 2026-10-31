@@ -86,15 +86,54 @@ These came out of getting trustworthy numbers. Each was confirmed by an experime
 
 ## Click tracking (Phase 3)
 
-Not yet benchmarked for latency on a quiet machine. The attempt in this session ran while a browser was using about 2.7 cores, so the generator fell behind in every run and the latencies were unusable. What could be measured reliably was **server CPU time per redirect** at 1,000 req/s (20 s, cache hits), alternating:
+**Status: G1 with click tracking on is not yet shown.** On this laptop, the same 4k req/s load that meets G1 cleanly with tracking off overloads the machine with tracking on. With tracking on, the laptop also hosts the Kafka broker taking 4,000 messages/s, plus the producer inside the server. The redirect never waits on Kafka (`test/click-emitter.test.ts`); what tracking costs is CPU headroom.
 
-| Click tracking | Run 1 | Run 2 |
+Same session, machine otherwise lightly loaded (OneDrive sync about 1 core; a browser at times), 2 generator threads, 20 s runs. Send lateness above 5 ms means the generator was starved, so that row's latency is unreliable.
+
+| Tracking | Scenario | Run | p50 ms | p90 ms | p99 ms | max ms | Send lateness p99 ms | Reliable |
+|---|---|---|---|---|---|---|---|---|
+| off | 100% hits | 1 | 1.0 | 2.0 | 11.9 | 62.5 | 4.7 | yes |
+| off | 100% hits | 2 | 0.9 | 1.7 | 8.5 | 67.8 | 3.1 | yes |
+| off | 95/5 mix: hits | 1 | 1.1 | 1.9 | 13.1 | 73.8 | 4.4 | yes |
+| off | 95/5 mix: misses | 1 | 3.0 | 4.6 | 38.4 | 83.1 | 4.4 | yes |
+| off | 95/5 mix: hits | 2 | 1.0 | 2.0 | 9.9 | 79.7 | 2.2 | yes |
+| off | 95/5 mix: misses | 2 | 2.9 | 5.2 | 20.5 | 84.2 | 2.2 | yes |
+| on | 100% hits | 1 | 1.2 | 3.3 | 25.0 | 57.8 | 4.3 | yes |
+| on | 95/5 mix: hits | 1 | 1.9 | 7.7 | 91.5 | 144.7 | 24.3 | no |
+| on | 95/5 mix: misses | 1 | 4.9 | 14.2 | 112.6 | 153.8 | 24.3 | no |
+| on | 100% hits | 2 | 1.9 | 9.0 | 63.6 | 100.3 | 22.5 | no |
+| on | 95/5 mix: hits | 2 | 1.3 | 4.0 | 26.2 | 71.4 | 8.5 | no |
+| on | 95/5 mix: misses | 2 | 3.5 | 8.3 | 34.3 | 91.2 | 8.5 | no |
+| on | 100% hits | 3 | 1.3 | 4.4 | 19.0 | 69.9 | 5.6 | no |
+| on | 95/5 mix: hits | 3 | 2.9 | 11.0 | 70.2 | 121.7 | 15.9 | no |
+| on | 95/5 mix: misses | 3 | 7.0 | 22.1 | 99.8 | 144.7 | 15.9 | no |
+
+Tracking off, every run is reliable and meets G1. Tracking on, the one reliable run meets the hit target (25.0 ms); the other eight were starved. Server CPU per redirect, measured separately at 1,000 req/s, rose by 20–130 µs with tracking (553/563 µs off vs 680/580 µs on; absolute values inflated by a busy machine).
+
+### Packing clicks into fewer Kafka messages
+
+The sink now sends one message per partition per batch, each a JSON array of events, instead of one message per click. Controlled measurement (40,000 events sent both ways from one producer, CPU per click, two alternating runs each):
+
+| Per click | One message per click | Packed (up to 500 per message) |
 |---|---|---|
-| off | 553 µs | 563 µs |
-| on (Kafka, `clicks.bench` topic) | 680 µs | 580 µs |
+| Producer CPU | 27–61 µs | 6–12 µs |
+| Broker CPU | 19–31 µs | 8–9 µs |
+| Building the event (unchanged) | 16 µs | 16 µs |
 
-So tracking costs roughly 20–130 µs of CPU per redirect, about 0.1–0.5 of a core at 4k req/s. The redirect never waits on Kafka (`test/click-emitter.test.ts`). The absolute numbers are inflated by the busy machine; compare the rows, not the values. To recheck G1 with tracking on a quiet machine:
-`KAFKA_BROKERS=localhost:9092 IP_HASH_SALT=bench CLICKS_TOPIC=clicks.bench BENCH_SECONDS=20 BENCH_REPS=3 BENCH_SCENARIOS=hit,mixed npm run bench:redirect`.
+End to end on this laptop, the gain didn't show clearly:
+- **Server CPU:** tracking added 105 / 59 / 18 µs per redirect with packing (three pairs), versus 127 / 17 µs without. Run-to-run noise (about ±40 µs) is as large as the expected saving.
+- **Latency at 4k req/s with tracking on** was still flagged in every run. OneDrive sync and a browser were using about 2 cores, but the generator fell behind less than before packing (send lateness p99 5.0–9.6 ms vs up to 24 ms):
+
+| Scenario | Run | p50 ms | p90 ms | p99 ms | max ms | Send lateness p99 ms |
+|---|---|---|---|---|---|---|
+| 100% hits | 1 | 1.5 | 3.8 | 15.3 | 52.2 | 5.0 |
+| 95/5 mix: hits | 1 | 2.0 | 9.9 | 31.7 | 62.4 | 9.6 |
+| 95/5 mix: misses | 1 | 5.2 | 20.1 | 58.9 | 90.5 | 9.6 |
+| 100% hits | 2 | 1.5 | 5.1 | 38.7 | 80.9 | 8.4 |
+| 95/5 mix: hits | 2 | 1.9 | 7.9 | 43.1 | 76.3 | 9.0 |
+| 95/5 mix: misses | 2 | 4.9 | 17.8 | 76.5 | 106.2 | 9.0 |
+
+None of these rows counts as evidence. What would settle G1 with tracking on is a run on an idle machine, or with Kafka (or the generator) on another machine.
 
 5. **Kafka's Docker healthcheck kept a core busy.** It ran a Kafka CLI tool every 3 s, and each run boots a JVM costing about 1.5 cores for a few seconds. Idle, the container sat at 112% CPU (6% after the fix), slowing every benchmark on the machine. The check now runs every 2 s during startup only, then every 5 minutes.
 

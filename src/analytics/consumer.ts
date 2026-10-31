@@ -20,7 +20,8 @@ const clickEventSchema = z.object({
   response_code: z.number().int(),
 }) satisfies z.ZodType<ClickEvent>;
 
-export type ConsumerStats = { messages: number; inserted: number; duplicates: number; invalid: number };
+// Counted per event: one Kafka message can carry many.
+export type ConsumerStats = { events: number; inserted: number; duplicates: number; invalid: number };
 
 // Writes events to click_events and adds them to the hourly rollups, in one
 // statement. Rollups only count rows that were actually inserted, so an event
@@ -70,32 +71,45 @@ export function createClickConsumer({ kafka, sql, topic, groupId }: Options) {
   const consumer = kafka.consumer({ kafkaJS: { groupId, fromBeginning: true, autoCommit: false } });
   const dlq = kafka.producer();
   const partitions = createPartitionManager(sql);
-  const stats: ConsumerStats = { messages: 0, inserted: 0, duplicates: 0, invalid: 0 };
+  const stats: ConsumerStats = { events: 0, inserted: 0, duplicates: 0, invalid: 0 };
   let maintenance: NodeJS.Timeout | undefined;
 
+  // A message is a JSON array of events (packed by the sink) or a single
+  // event object (the earlier format, still accepted). Each unreadable event,
+  // or message, goes to the DLQ on its own.
   async function handle(values: (Buffer | null)[]) {
     const valid = new Map<string, ClickEvent>();
     const invalid: string[] = [];
+    let seen = 0;
     for (const value of values) {
       const text = value?.toString() ?? "";
-      let parsed;
+      let items: unknown[];
       try {
-        parsed = clickEventSchema.safeParse(JSON.parse(text));
+        const json: unknown = JSON.parse(text);
+        items = Array.isArray(json) ? json : [json];
       } catch {
-        parsed = null;
+        invalid.push(text);
+        continue;
       }
-      if (parsed?.success) valid.set(parsed.data.event_id, parsed.data);
-      else invalid.push(text);
+      for (const item of items) {
+        const parsed = clickEventSchema.safeParse(item);
+        if (parsed.success) {
+          seen++;
+          valid.set(parsed.data.event_id, parsed.data);
+        } else {
+          invalid.push(JSON.stringify(item));
+        }
+      }
     }
     const events = [...valid.values()];
     await partitions.ensure(new Set(events.map((e) => new Date(e.ts).toISOString().slice(0, 10))));
     const inserted = events.length ? await ingest(sql, events) : 0;
     if (invalid.length) await dlq.send({ topic: `${topic}.dlq`, messages: invalid.map((value) => ({ value })) });
 
-    stats.messages += values.length;
+    stats.events += seen;
     stats.inserted += inserted;
     stats.invalid += invalid.length;
-    stats.duplicates += values.length - invalid.length - inserted;
+    stats.duplicates += seen - inserted;
   }
 
   return {
