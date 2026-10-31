@@ -7,7 +7,16 @@ const redis = new Redis(process.env.TEST_REDIS_URL!);
 afterAll(() => redis.disconnect());
 
 const freshCode = () => `t${randomBytes(5).toString("hex")}`;
-const link = (url: string): CachedLink => ({ url, status: "active", redirectType: 302, active: true, expiresAt: null });
+const link = (url: string): CachedLink => ({
+  id: "1",
+  tenantId: "t",
+  url,
+  status: "active",
+  redirectType: 302,
+  active: true,
+  expiresAt: null,
+  maxClicks: null,
+});
 
 // A stand-in for the Postgres lookup that counts calls and can be held open.
 function fakeLoader(initial: Record<string, CachedLink> = {}) {

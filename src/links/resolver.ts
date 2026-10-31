@@ -2,11 +2,14 @@ import type { Redis } from "ioredis";
 
 // What the redirect handler needs to know about a link.
 export type CachedLink = {
+  id: string;
+  tenantId: string;
   url: string;
   status: string;
   redirectType: 301 | 302;
   active: boolean;
   expiresAt: number | null; // epoch ms; checked at request time, not baked into the TTL
+  maxClicks: number | null;
 };
 
 export type LinkResolver = {
@@ -36,7 +39,9 @@ if (redis.call('GET', KEYS[2]) or '') == ARGV[3] then
 end
 return 0`;
 
-const cacheKey = (code: string) => `link:c:${code}`;
+// The version in the prefix changes whenever CachedLink's shape does, so old
+// entries are never read as the new shape.
+const cacheKey = (code: string) => `link:c2:${code}`;
 const generationKey = (code: string) => `link:gen:${code}`;
 
 // Cache-aside lookup of links in Redis (PRD §6.3):

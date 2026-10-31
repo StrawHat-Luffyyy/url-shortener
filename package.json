@@ -10,9 +10,11 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "bench:redirect": "tsx bench/redirect.ts"
+    "bench:redirect": "tsx bench/redirect.ts",
+    "consumer": "tsx src/consumer.ts"
   },
   "dependencies": {
+    "@confluentinc/kafka-javascript": "^1.11.0",
     "@hono/node-server": "^2.1.5",
     "hono": "^4.13.14",
     "ioredis": "^6.0.0",

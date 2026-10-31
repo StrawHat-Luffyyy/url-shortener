@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { Hono } from "hono";
+import type { Redis } from "ioredis";
 import postgres, { type Sql, type TransactionSql } from "postgres";
 import { z } from "zod";
 import { ApiError, parseBody } from "../errors";
 import { codeForId } from "./codes";
 import { parseDestination } from "./destination";
+import { clickEvent, type ClickTracking } from "../analytics/click-tracking";
 import type { IdAllocator } from "./id-allocator";
 import type { CachedLink, LinkResolver } from "./resolver";
 
@@ -199,15 +201,23 @@ export function linkRoutes({ sql, ids, links, baseUrl }: Deps) {
 // The redirect handler's view of a link, read from Postgres on a cache miss.
 export function loadLinkForRedirect(sql: Sql) {
   return async (code: string): Promise<CachedLink | null> => {
-    const [row] = await sql<Pick<LinkRow, "long_url" | "status" | "redirect_type" | "active" | "expires_at">[]>`
-      SELECT long_url, status, redirect_type, active, expires_at FROM links WHERE code = ${code}`;
+    const [row] = await sql<
+      (Pick<LinkRow, "id" | "long_url" | "status" | "redirect_type" | "active" | "expires_at" | "max_clicks"> & {
+        tenant_id: string;
+      })[]
+    >`
+      SELECT id, tenant_id, long_url, status, redirect_type, active, expires_at, max_clicks
+      FROM links WHERE code = ${code}`;
     if (!row) return null;
     return {
+      id: String(row.id),
+      tenantId: row.tenant_id,
       url: row.long_url,
       status: row.status,
       redirectType: row.redirect_type === 301 ? 301 : 302,
       active: row.active,
       expiresAt: row.expires_at?.getTime() ?? null,
+      maxClicks: row.max_clicks,
     };
   };
 }
@@ -216,8 +226,28 @@ export function loadLinkForRedirect(sql: Sql) {
 // without touching the cache or the database.
 const CODE_SHAPE = /^[A-Za-z0-9_-]{3,32}$/;
 
+// Counts a click against a link's max_clicks (FR-4) and returns the new count,
+// or null if it couldn't be counted. Redis INCR is atomic, so concurrent
+// clicks can't both take the last slot. If Redis is unreachable the limit
+// isn't enforced (fails open) rather than failing the redirect.
+export function redisClickCounter(redis: Redis) {
+  return (linkId: string): Promise<number | null> =>
+    redis.incr(`link:clicks:${linkId}`).catch((err: unknown) => {
+      console.error(`max_clicks not enforced for link ${linkId}: Redis unavailable`, err);
+      return null;
+    });
+}
+
+type RedirectDeps = {
+  links: LinkResolver;
+  countClick: (linkId: string) => Promise<number | null>;
+  clicks?: ClickTracking;
+};
+
 // Public redirect (FR-8, FR-9). Mounted last so it never shadows /v1 routes.
-export function redirectRoute(links: LinkResolver) {
+// Every response for an existing link emits a click event (FR-11); emitting
+// never waits, so Kafka can't slow the redirect down.
+export function redirectRoute({ links, countClick, clicks }: RedirectDeps) {
   const routes = new Hono();
 
   routes.get("/:code", async (c) => {
@@ -227,10 +257,18 @@ export function redirectRoute(links: LinkResolver) {
 
     const expired = link.expiresAt !== null && link.expiresAt <= Date.now();
     // Only active links redirect. Phase 4 adds the interstitial for quarantined links.
-    if (link.status !== "active" || !link.active || expired) {
+    let gone = link.status !== "active" || !link.active || expired;
+    // Only links with a limit pay for the extra Redis call.
+    if (!gone && link.maxClicks !== null) {
+      const count = await countClick(link.id);
+      gone = count !== null && count > link.maxClicks;
+    }
+    if (gone) {
+      clicks?.emitter.emit(clickEvent(c, link, 410, clicks));
       throw new ApiError(410, "LINK_GONE", "This short link is no longer available");
     }
 
+    clicks?.emitter.emit(clickEvent(c, link, link.redirectType, clicks));
     if (link.redirectType === 302) {
       // Keep every click observable: browsers must not cache a 302 (FR-8).
       c.header("cache-control", "private, no-store");

@@ -4,24 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-Phases 0 (Foundations), 1 (Core shortener) and 2 (Performance) are built; benchmark results and findings are in `docs/benchmarks.md`. The spec is `PRD AI-Protected URL Shortening Service.docx` (Draft v1). Add commands below only once they actually work (Kafka is still to come).
+Phases 0 (Foundations), 1 (Core shortener), 2 (Performance) and 3 (Analytics pipeline) are built; benchmark results and findings are in `docs/benchmarks.md`. The spec is `PRD AI-Protected URL Shortening Service.docx` (Draft v1). Add commands below only once they actually work.
 
-Deferred from Phase 1 on purpose. Each needs a piece from a later phase:
-- `max_clicks` is stored but not enforced, because that needs click counting (Phase 3).
+Deferred on purpose. Each needs a piece from a later phase:
 - Quarantined links don't get the interstitial page yet (Phase 4).
 - Status transitions aren't audited yet.
+- Click events carry `asn`, `is_datacenter_asn` and (without a trusted proxy) `country` as null: there's no GeoIP/ASN lookup yet (Phase 5 needs it).
+- Labels come only from user-agent rules; everything not caught is `human` until the Phase 5 model.
+- The G1 redirect benchmark hasn't been rerun with click tracking on a quiet machine. Tracking adds about 20–130 µs of server CPU per redirect (docs/benchmarks.md).
 - There's no DB-sequence fallback when Redis is down (`link_id_fallback_seq` exists but is unused; that's failure-mode work). Its range must not overlap the Redis counter's.
 
 ## Commands
 
 ```bash
-docker compose up -d --wait          # Postgres 17 (5432; creates shortener + shortener_test) and Redis 7 (6379)
-npm test                             # Vitest; global setup migrates shortener_test first. Needs Postgres + Redis (db 1)
+docker compose up -d --wait          # Postgres 17 (5432; creates shortener + shortener_test), Redis 7 (6379), Kafka 4.1 KRaft (9092)
+npm test                             # Vitest; global setup migrates shortener_test first. Needs Postgres, Redis (db 1) and Kafka
 npx vitest run test/keys.test.ts     # one file
 npx vitest run -t "revoked key"      # tests whose name matches
 npm run typecheck                    # tsc --noEmit (no lint configured yet)
 npm run migrate                      # apply src/db/migrations/*.sql to $DATABASE_URL
-npm run dev                          # tsx watch src/server.ts; needs DATABASE_URL, REDIS_URL, OPERATOR_TOKEN, BASE_URL (see .env.example)
+npm run dev                          # tsx watch src/server.ts; needs DATABASE_URL, REDIS_URL, OPERATOR_TOKEN, BASE_URL; clicks need KAFKA_BROKERS + IP_HASH_SALT (.env.example)
+npm run consumer                     # analytics consumer: clicks.raw → click_events + rollups; needs DATABASE_URL, KAFKA_BROKERS
 npm run bench:redirect               # redirect load test against the dev DB (seeds, runs, cleans up); BENCH_* env vars in bench/redirect.ts
                                      # two machines: BENCH_MODE=serve here, BENCH_MODE=load BENCH_TARGET=http://<ip>:3990 there
 ```
@@ -53,6 +56,14 @@ There is no build step: tsx runs the TypeScript directly. Vitest is pinned to 4.
 - Rate limits (`src/rate-limit.ts`): a per-tenant token bucket in Redis (Lua, Redis server clock). `create` covers `POST /v1/links`, `api` covers every other tenant call; redirects aren't limited. If Redis is down, each instance limits locally. Tests get unlimited buckets from `newInstance()` unless they pass `rateLimits`.
 - Production Redis client (`src/server.ts`): `enableOfflineQueue: false` and a 100 ms command timeout, so an outage falls back instead of hanging requests. Keep `keepAliveTimeout` at 65 s (see docs/benchmarks.md finding 3).
 - Benchmarks: use `bench/redirect.ts` (open-loop, paced, multi-threaded, flags a generator that falls behind). Don't go back to autocannon's `overallRate`: it sends in bursts and inflated p99 about 17×.
+- Click pipeline (`src/analytics/`):
+  - `emitter.ts`: the redirect calls `emit()`, which never waits or throws. It uses a bounded buffer, one batch in flight, and a failed batch goes back in the buffer; overflow is dropped and counted. `createKafkaSink` caps each attempt at 10 s because librdkafka took 81 s to give up on a dead broker. Don't use the client's `connectionTimeout` for this: it made connects hang instead.
+  - `consumer.ts`: one SQL statement inserts into `click_events` with `ON CONFLICT DO NOTHING` and builds the rollups **from the rows actually inserted**. That's the whole dedup story (replay and redelivery count once). Offsets are committed after the DB write. Bad messages go to `<topic>.dlq`.
+  - `partitions.ts`: `click_events` has UTC-day partitions, created ahead of time, and dropped after 90 days. A day must be created before its rows arrive, or they land in the default partition for good.
+  - Analytics API (`routes.ts`): clicks and series come from rollups (kept forever). Uniques and top-N come from raw events (90 days, reported as `rawFrom`). The `bot` view counts `suspected_bot` + `known_crawler`.
+  - Kafka tests use a topic per test file (`test/kafka-helpers.ts`); `eventually()` waits for the consumer. To replay a group, delete it with the admin client (there's no offset-reset API in this client).
+- `max_clicks`: an atomic Redis `INCR link:clicks:<id>` on redirect, only for links that set it. It fails open (not enforced) when Redis is down.
+- Kafka's compose healthcheck boots a JVM per run. Keep it on `start_interval` + a long `interval`: at 3 s it held a core busy and wrecked benchmarks.
 - Aliases share the code namespace with generated codes and are global across tenants (409 `ALIAS_TAKEN`).
 - Idempotency is a per-(tenant, key) advisory lock plus the `idempotency_keys` row. Reusing a key for a different body is a 422.
 - Migrations: plain SQL files `src/db/migrations/NNN_name.sql`, applied in filename order and tracked in `schema_migrations`. Never edit an applied migration; add a new one.

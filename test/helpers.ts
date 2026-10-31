@@ -20,7 +20,7 @@ export function setupApp({ poolSize = 5 } = {}) {
   // Each call builds a separate app instance with its own ID allocator, like a
   // separate API process; they share the database and Redis.
   // Rate limits are effectively off unless a test passes its own.
-  const newInstance = (opts: Pick<AppDeps, "idBlockSize" | "rateLimits"> = {}) =>
+  const newInstance = (opts: Pick<AppDeps, "idBlockSize" | "rateLimits" | "clickTracking"> = {}) =>
     createApp({ sql, redis, operatorToken: OPERATOR_TOKEN, baseUrl: BASE_URL, rateLimits: UNLIMITED, ...opts });
   const app = newInstance();
 

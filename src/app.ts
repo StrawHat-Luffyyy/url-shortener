@@ -3,11 +3,13 @@ import { Hono } from "hono";
 import type { Redis } from "ioredis";
 import type { Sql } from "postgres";
 import { z } from "zod";
+import type { ClickTracking } from "./analytics/click-tracking";
+import { analyticsRoutes } from "./analytics/routes";
 import { authenticateApiKey, issueApiKey } from "./auth/api-keys";
 import { ApiError, errorResponse, parseBody } from "./errors";
 import { createIdAllocator } from "./links/id-allocator";
 import { createLinkResolver } from "./links/resolver";
-import { linkRoutes, loadLinkForRedirect, redirectRoute } from "./links/routes";
+import { linkRoutes, loadLinkForRedirect, redirectRoute, redisClickCounter } from "./links/routes";
 import { createRateLimiter, type Bucket } from "./rate-limit";
 
 export type AppDeps = {
@@ -20,6 +22,8 @@ export type AppDeps = {
   // Per-tenant token buckets: `create` for POST /v1/links, `api` for every
   // other tenant call. Redirects are not limited per tenant.
   rateLimits?: { create: Bucket; api: Bucket };
+  // Where redirects send click events. Without it, no clicks are recorded.
+  clickTracking?: ClickTracking;
 };
 
 const DEFAULT_RATE_LIMITS = {
@@ -46,6 +50,7 @@ export function createApp({
   baseUrl,
   idBlockSize,
   rateLimits = DEFAULT_RATE_LIMITS,
+  clickTracking,
 }: AppDeps) {
   const app = new Hono<Env>();
 
@@ -132,9 +137,10 @@ export function createApp({
 
   const links = createLinkResolver({ redis, load: loadLinkForRedirect(sql) });
   tenantApi.route("/", linkRoutes({ sql, ids: createIdAllocator(redis, sql, idBlockSize), links, baseUrl }));
+  tenantApi.route("/", analyticsRoutes(sql));
 
   app.route("/v1/operator", operator);
   app.route("/v1", tenantApi);
-  app.route("/", redirectRoute(links));
+  app.route("/", redirectRoute({ links, countClick: redisClickCounter(redis), clicks: clickTracking }));
   return app;
 }

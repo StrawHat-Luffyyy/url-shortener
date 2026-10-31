@@ -84,6 +84,20 @@ These came out of getting trustworthy numbers. Each was confirmed by an experime
    - Going from 4 to 8 generator threads starved the server (p50 1.8–3.8 s).
    - Raising the server's OS priority brought hit p99 from 23–102 ms down to 14–21 ms.
 
+## Click tracking (Phase 3)
+
+Not yet benchmarked for latency on a quiet machine. The attempt in this session ran while a browser was using about 2.7 cores, so the generator fell behind in every run and the latencies were unusable. What could be measured reliably was **server CPU time per redirect** at 1,000 req/s (20 s, cache hits), alternating:
+
+| Click tracking | Run 1 | Run 2 |
+|---|---|---|
+| off | 553 µs | 563 µs |
+| on (Kafka, `clicks.bench` topic) | 680 µs | 580 µs |
+
+So tracking costs roughly 20–130 µs of CPU per redirect, about 0.1–0.5 of a core at 4k req/s. The redirect never waits on Kafka (`test/click-emitter.test.ts`). The absolute numbers are inflated by the busy machine; compare the rows, not the values. To recheck G1 with tracking on a quiet machine:
+`KAFKA_BROKERS=localhost:9092 IP_HASH_SALT=bench CLICKS_TOPIC=clicks.bench BENCH_SECONDS=20 BENCH_REPS=3 BENCH_SCENARIOS=hit,mixed npm run bench:redirect`.
+
+5. **Kafka's Docker healthcheck kept a core busy.** It ran a Kafka CLI tool every 3 s, and each run boots a JVM costing about 1.5 cores for a few seconds. Idle, the container sat at 112% CPU (6% after the fix), slowing every benchmark on the machine. The check now runs every 2 s during startup only, then every 5 minutes.
+
 ## Not covered yet
 
 - **Creation latency under sustained load.** PRD target: p99 < 150 ms; not benchmarked yet.
